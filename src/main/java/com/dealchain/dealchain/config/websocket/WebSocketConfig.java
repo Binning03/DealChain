@@ -1,0 +1,45 @@
+package com.dealchain.dealchain.config.websocket;
+
+import org.springframework.context.annotation.Configuration;
+import org.springframework.messaging.simp.config.ChannelRegistration;
+import org.springframework.messaging.simp.config.MessageBrokerRegistry;
+import org.springframework.web.socket.config.annotation.EnableWebSocketMessageBroker;
+import org.springframework.web.socket.config.annotation.StompEndpointRegistry;
+import org.springframework.web.socket.config.annotation.WebSocketMessageBrokerConfigurer;
+
+@Configuration
+@EnableWebSocketMessageBroker
+public class WebSocketConfig implements WebSocketMessageBrokerConfigurer {
+
+    private final JwtChannelInterceptor jwtChannelInterceptor;
+
+    public WebSocketConfig(JwtChannelInterceptor jwtChannelInterceptor) {
+        this.jwtChannelInterceptor = jwtChannelInterceptor;
+    }
+
+    @Override
+    public void configureClientInboundChannel(ChannelRegistration registration) {
+        registration.interceptors(jwtChannelInterceptor);
+    }
+    // 엔드포인트 등록을 위한 설정
+    @Override
+    public void registerStompEndpoints(StompEndpointRegistry registry) {
+        registry.addEndpoint("/ws")
+                // localhost와 127.0.0.1 모두 허용하도록 수정
+                .setAllowedOriginPatterns("http://localhost:*", "http://127.0.0.1:*")
+                .withSockJS(); // SockJS 사용 중이므로 유지
+    }
+
+    // prefix로 sub이 붙으면 구독(메시지를 받는거임), pub이 붙으면 메시지 송신
+    @Override
+    public void configureMessageBroker(MessageBrokerRegistry registry) {
+
+        //  "/sub"(공개 채팅) 외에 "/queue"(사적 알림)도 브로커가 처리하도록 추가
+        registry.enableSimpleBroker("/sub", "/queue");
+
+        registry.setApplicationDestinationPrefixes("/pub");
+
+        //유저한테 개인 알림
+        registry.setUserDestinationPrefix("/user");
+    }
+}

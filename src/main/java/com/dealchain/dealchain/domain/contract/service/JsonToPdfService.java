@@ -1,0 +1,270 @@
+package com.dealchain.dealchain.domain.contract.service;
+
+import com.dealchain.dealchain.domain.security.S3UploadService;
+import com.dealchain.dealchain.domain.security.XssSanitizer;
+import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import jakarta.annotation.PostConstruct;
+import org.apache.pdfbox.pdmodel.PDDocument;
+import org.apache.pdfbox.pdmodel.PDPage;
+import org.apache.pdfbox.pdmodel.PDPageContentStream;
+import org.apache.pdfbox.pdmodel.common.PDRectangle;
+import org.apache.pdfbox.pdmodel.font.PDType0Font;
+import org.apache.pdfbox.pdmodel.graphics.image.PDImageXObject;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.core.io.ClassPathResource;
+import org.springframework.stereotype.Service;
+
+import java.io.ByteArrayOutputStream;
+import java.io.InputStream;
+import java.util.Collections;
+import java.util.Map;
+
+import java.io.FileOutputStream;
+
+@Service
+public class JsonToPdfService {
+
+    private static final int MAX_JSON_SIZE = 5_242_880;//5MB
+
+    private final XssSanitizer xssSanitizer;
+    private final ObjectMapper objectMapper;
+    private final S3UploadService s3UploadService;
+    private PDType0Font nanumGothicFont;
+    private static final Logger log = LoggerFactory.getLogger(JsonToPdfService.class);
+
+    // A4 페이지 크기 (pt)
+    private static final float PAGE_WIDTH = PDRectangle.A4.getWidth();
+    private static final float MARGIN_X = 70;
+    private static final float MARGIN_TOP = 780; // (페이지 상단 Y 좌표)
+
+    public JsonToPdfService(XssSanitizer xssSanitizer,
+                            ObjectMapper objectMapper,
+                            S3UploadService s3UploadService) {
+        this.xssSanitizer = xssSanitizer;
+        this.objectMapper = objectMapper;
+        this.s3UploadService = s3UploadService;
+    }
+
+    /**
+     * 폰트 로드
+     */
+    @PostConstruct
+    public void loadFont() {
+        try (InputStream fontStream = new ClassPathResource("fonts/Font.ttf").getInputStream()) {
+            try (PDDocument tempDoc = new PDDocument()) {
+                this.nanumGothicFont = PDType0Font.load(tempDoc, fontStream);
+            }
+        } catch (Exception e) {
+            log.error("치명적 오류: PDF 한글 폰트(Font.ttf) 로드에 실패했습니다.", e);
+            throw new RuntimeException("PDF 한글 폰트 로드 실패", e);
+        }
+    }
+
+    /**
+     * JSON과 2개의 S3 서명 키로 PDF를 생성
+     *
+     * @param aiContractJson    AI가 생성한 JSON 문자열
+     * @param sellerSignatureKey 판매자 서명의 S3 파일 키
+     * @param buyerSignatureKey  구매자 서명의 S3 파일 키
+     * @return PDF 파일의 byte 배열
+     */
+    public byte[] createPdf(String aiContractJson,
+                            String sellerSignatureKey,
+                            String buyerSignatureKey) throws Exception {
+
+        if (aiContractJson == null || aiContractJson.length() > MAX_JSON_SIZE) {
+            log.error("DoS 공격 의심: AI JSON 크기가 {}바이트를 초과했습니다. (Size: {})",
+                    MAX_JSON_SIZE, (aiContractJson == null ? 0 : aiContractJson.length()));
+            throw new IllegalArgumentException("AI가 생성한 계약서 데이터가 너무 큽니다.");
+        }
+
+        //xss 검증
+        Map<String, Object> contractMap = sanitizeJsonMap(aiContractJson);
+
+        try (PDDocument document = new PDDocument();
+             ByteArrayOutputStream out = new ByteArrayOutputStream()) {
+
+            PDPage page = new PDPage(PDRectangle.A4);
+            document.addPage(page);
+
+            try (PDPageContentStream stream = new PDPageContentStream(document, page)) {
+
+                drawText(stream, "자동 생성 계약서 (초안)", (PAGE_WIDTH - 180) / 2, MARGIN_TOP, 20);
+
+                float currentY = MARGIN_TOP - 60;
+
+                // AI JSON 데이터 추출 (Null-Safe)
+                Map<String, Object> parties = getMap(contractMap, "parties");
+                Map<String, Object> item = getMap(contractMap, "item_details");
+                Map<String, Object> payment = getMap(contractMap, "payment");
+                Map<String, Object> deal = getMap(contractMap, "delivery");
+                Map<String, Object> otherTerms = getMap(contractMap, "other_terms");
+                Map<String, Object> cancellationPolicy = getMap(contractMap, "cancellation_policy"); //  cancellation_policy 추출
+                Map<String, Object> refundPolicy = getMap(contractMap, "refund_policy"); // refund_policy 추출
+                Map<String, Object> disputeResolution = getMap(contractMap, "dispute_resolution"); // dispute_resolution 추출
+
+                currentY = drawSection(stream, "1. 거래 당사자", currentY);
+                currentY = drawTextLine(stream, " - 판매자 (갑): " + getString(getMap(parties, "seller"), "name"), currentY);
+                currentY = drawTextLine(stream, " - 구매자 (을): " + getString(getMap(parties, "buyer"), "name"), currentY);
+
+                currentY = drawSection(stream, "2. 거래 물품", currentY - 10);
+                currentY = drawTextLine(stream, " - 물품명: " + getString(item, "name"), currentY);
+                currentY = drawTextLine(stream, " - 물품상태: " + getString(item, "condition_and_info"), currentY);
+
+                currentY = drawSection(stream, "3. 거래 대금", currentY - 10);
+                currentY = drawTextLine(stream, " - 가격: " + getString(payment, "price") + " 원", currentY);
+                currentY = drawTextLine(stream, " - 지급방식: " + getString(payment, "payment_method"), currentY);
+
+                currentY = drawSection(stream, "4. 거래 방법", currentY - 10);
+                currentY = drawTextLine(stream, " - 방식: " + getString(deal, "method"), currentY);
+                currentY = drawTextLine(stream, " - 시간: " + getString(deal, "schedule"), currentY);
+                currentY = drawTextLine(stream, " - 장소: " + getString(deal, "location"), currentY);
+
+                //  5. 청약 철회 (cancellation_policy) 섹션 추가
+                currentY = drawSection(stream, "5. 청약 철회 및 계약 해제", currentY - 10);
+                currentY = drawTextLine(stream, " - " + getString(cancellationPolicy, "details"), currentY);
+
+                //6. 환불 정책 (refund_policy) 섹션 추가
+                currentY = drawSection(stream, "6. 교환·반품·보증 및 환불", currentY - 10);
+                currentY = drawTextLine(stream, " - " + getString(refundPolicy, "details"), currentY);
+
+                // 7. 분쟁 해결 (dispute_resolution) 섹션 추가
+                currentY = drawSection(stream, "7. 소비자 피해보상 및 불만 처리", currentY - 10);
+                currentY = drawTextLine(stream, " - " + getString(disputeResolution, "details"), currentY);
+
+                // 섹션 번호 변경 "5." -> "8."
+                currentY = drawSection(stream, "8. 기타 거래 조건", currentY - 10);
+                String techSpecs = getString(otherTerms, "technical_specs");
+                String generalTerms = getString(otherTerms, "general_terms");
+                currentY = drawTextLine(stream, " - 기술 사양: " + techSpecs, currentY);
+                currentY = drawTextLine(stream, " - 일반 조건: " + generalTerms, currentY);
+
+
+                // 판매자 서명 (왼쪽 하단)
+                float sellerSignY = 150;
+                String sellerText = "판매자 (갑): " + getString(getMap(parties, "seller"), "name");
+                drawText(stream, sellerText, MARGIN_X, sellerSignY, 12);
+                drawText(stream, "----------------", MARGIN_X, sellerSignY + 7, 12);
+                drawImageFromS3(document, stream, sellerSignatureKey, MARGIN_X, sellerSignY + 20);
+
+                // 구매자 서명 (오른쪽 하단)
+                float buyerSignX = MARGIN_X + 280;
+                float buyerSignY = 150;
+                String buyerText = "구매자 (을): " + getString(getMap(parties, "buyer"), "name");
+                drawText(stream, buyerText, buyerSignX, buyerSignY, 12);
+                drawText(stream, "----------------", buyerSignX, buyerSignY + 7, 12);
+                drawImageFromS3(document, stream, buyerSignatureKey, buyerSignX, buyerSignY + 20);
+
+            }
+
+            document.save(out);
+            return out.toByteArray();
+        }
+    }
+
+    /**
+     * S3에서 이미지를 다운로드하여 PDF의 (x, y) 좌표에 그리기
+     */
+    private void drawImageFromS3(PDDocument document, PDPageContentStream stream, String s3Key, float x, float y) {
+        if (s3Key == null || s3Key.isEmpty()) {
+            return;
+        }
+        try {
+            // S3UploadService를 통해 신뢰할 수 있는 버킷에서 이미지 다운로드
+            byte[] imageBytes = s3UploadService.downloadFile(s3Key);
+            PDImageXObject pdImage = PDImageXObject.createFromByteArray(document, imageBytes, s3Key);
+            stream.drawImage(pdImage, x, y, 95, 50);
+
+        } catch (Exception e) {
+            // 서명 이미지 실패해도 PDF 생성 계속 (DoS 방지)
+            log.warn("S3 서명 이미지 다운로드/삽입 실패 (PDF 생성은 계속됨). Key: {}, Error: {}",
+                    s3Key, e.getMessage());
+        }
+    }
+
+
+    private Map<String, Object> sanitizeJsonMap(String jsonString) throws Exception {
+        TypeReference<Map<String, Object>> typeRef = new TypeReference<>() {};
+        Map<String, Object> map = objectMapper.readValue(jsonString, typeRef);
+        sanitizeMapRecursively(map);
+        return map;
+    }
+
+    @SuppressWarnings("unchecked")
+    private void sanitizeMapRecursively(Map<String, Object> map) {
+        for (Map.Entry<String, Object> entry : map.entrySet()) {
+            Object value = entry.getValue();
+            if (value instanceof String) {
+                entry.setValue(xssSanitizer.sanitizeToPlainText((String) value));
+            } else if (value instanceof Map) {
+                sanitizeMapRecursively((Map<String, Object>) value);
+            }
+        }
+    }
+
+
+    /**
+     * PDF에 텍스트를 그리기
+     */
+    private void drawText(PDPageContentStream stream, String text, float x, float y, float fontSize) throws Exception {
+        if (text == null) {
+            text = "(정보 없음)";
+        }
+        stream.beginText();
+        stream.setFont(this.nanumGothicFont, fontSize);
+        stream.newLineAtOffset(x, y);
+        stream.showText(text);
+        stream.endText();
+    }
+
+    /**
+     * PDF에 한 줄의 텍스트를 그리고 Y 좌표를 업데이트
+     */
+    private float drawTextLine(PDPageContentStream stream, String text, float y) throws Exception {
+        float fontSize = 11;
+        float leading = 16; // 줄 간격
+        drawText(stream, text, MARGIN_X, y, fontSize);
+        return y - leading;
+    }
+
+    /**
+     * PDF에 섹션 제목을 그리기
+     */
+    private float drawSection(PDPageContentStream stream, String text, float y) throws Exception {
+        float fontSize = 14;
+        float leading = 20;
+        drawText(stream, text, MARGIN_X, y, fontSize);
+        return y - leading;
+    }
+
+    /**
+     * Map에서 값을 String으로 안전하게 추출 (Null-Safe)
+     * null이면 "(정보 없음)" 반환
+     */
+    private String getString(Map<String, Object> map, String key) {
+        if (map == null) return "(정보 없음)";
+        Object val = map.get(key);
+        // [수정] AI가 "null"을 문자열이 아닌 진짜 null 값으로 반환하는 경우를 대비
+        if (val == null || "null".equals(String.valueOf(val))) {
+            return "(정보 없음)";
+        }
+        return String.valueOf(val);
+    }
+
+    /**
+     * Map에서 중첩된 Map을 안전하게 추출 (Null-Safe)
+     * Map이 아니거나 null이면 빈 Map 반환
+     */
+    private Map<String, Object> getMap(Map<String, Object> map, String key) {
+        if (map == null) return Collections.emptyMap(); // [수정] 상위 맵이 null일 경우 NPE 방지
+        Object val = map.get(key);
+        if (val instanceof Map) {
+            @SuppressWarnings("unchecked")
+            Map<String, Object> nestedMap = (Map<String, Object>) val;
+            return nestedMap;
+        }
+        return Collections.emptyMap();
+    }
+}
